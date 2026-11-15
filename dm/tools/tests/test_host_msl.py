@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import textwrap
 from types import SimpleNamespace as NS
 import unittest
@@ -42,7 +43,7 @@ class HostMSL(unittest.TestCase):
         tools.mkdir()
         compiler = tools / 'xcrun'
         compiler.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
-            import json, os, pathlib, sys
+            import json, os, pathlib, sys, time
             args = sys.argv[1:]
             if '--show-sdk-path' in args:
                 print(os.environ['TEST_METAL_SDK'])
@@ -51,6 +52,11 @@ class HostMSL(unittest.TestCase):
                 if not version: sys.exit(1)
                 print(version)
             else:
+                if gate := os.environ.get('TEST_METAL_WAIT'):
+                    until = time.monotonic() + 10
+                    while not pathlib.Path(gate).exists():
+                        if time.monotonic() > until: sys.exit('C compilation waited for unrelated Metal output')
+                        time.sleep(0.01)
                 with open(os.environ['TEST_METAL_LOG'], 'a') as f:
                     f.write(json.dumps(args) + '\\n')
                 pathlib.Path(args[args.index('-o') + 1]).write_bytes(b'compiled library')
@@ -124,6 +130,28 @@ class HostMSL(unittest.TestCase):
         self.make('MACOS_MIN=26.7')
         self.assertEqual(len(self.compiles()), 5)
 
+    def test_cold_c_compile_overlaps_metal_but_embedding_waits_for_header(self):
+        self.host_dirs(['dm/host', 'dm/gfx/nvn'])
+        (self.root / 'dm/host/main.c').write_text('int main(void) { return 0; }')
+        (self.root / 'dm/gfx/nvn/host_msl.m').write_text('#include "host_msl_gen.h"')
+        marker = self.root / 'main-started'
+        self.env['TEST_METAL_WAIT'] = str(marker)
+        compiler = self.root / 'bin/clang'
+        compiler.write_text(f'#!{sys.executable}\n' + textwrap.dedent(f'''\
+            import pathlib, sys
+            out = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])
+            header = pathlib.Path({str(self.header)!r})
+            if 'main.c.o' in str(out): pathlib.Path({str(marker)!r}).write_text(str(header.exists()))
+            else: assert header.is_file(), 'embedding compiled before its generated header'
+            out.write_bytes(b'object')
+            '''))
+        compiler.chmod(0o755)
+        targets = [f'gen/{GAME}/obj/host/main.c.o', f'gen/{GAME}/obj/gfx/nvn/host_msl.m.o']
+        result = subprocess.run(['make', '-s', '-j2', f'GAME={GAME}', *targets], cwd=self.root / 'dm/host', env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(marker.read_text(), 'False', 'unrelated C work must start before the Metal header is ready')
+        self.assertTrue(all((self.root / 'dm/host' / target).is_file() for target in targets))
+
     def test_regress_cache_refreshes_shaders_before_reusing_a_host(self):
         regress = script('regress')
         self.host_dirs(regress.HOST_DIRS)
@@ -167,7 +195,10 @@ class HostMSL(unittest.TestCase):
 
         def run(cmd, log, env=None, cwd=None):
             if f'gen/{GAME}/dmhost' in cmd:   # the host itself (make gen/<id>/dmhost), which the script copies to out
-                self.assertTrue(self.header.is_file(), 'the host build needs the header the key fingerprints')
+                # A cold complete make also generates the header; subsequent key checks must see it.
+                p = real_run(['make', '-s', f'GAME={GAME}', 'host_msl'], cwd=cwd, env=env, capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertTrue(self.header.is_file(), 'the completed host make generates the header the key fingerprints')
                 builds.append(cmd)
                 built = self.root / f'dm/host/gen/{GAME}/dmhost'; built.parent.mkdir(parents=True, exist_ok=True); built.write_bytes(b'host executable')
             else:
@@ -231,6 +262,50 @@ class HostMSL(unittest.TestCase):
             record.unlink()
             self.assertIsNone(nsp.decoder_host_key(out))
             build(); self.assertEqual(nsp.decoder_host_key(out), before)
+
+
+class HostAndFonts(unittest.TestCase):
+    def test_host_failure_cancels_background_fonts(self):
+        nsp = script('build_ipa_from_nsp'); started = threading.Event(); stopped = []
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d)
+            def host(*args):
+                self.assertTrue(started.wait(5)); raise nsp.BuildError('host failed')
+            def fonts(py, repo, path, env, logs, cancel):
+                started.set(); stopped.append(cancel.wait(5)); return work / 'font'
+            with patch.object(nsp, 'build_mac_host', host), patch.object(nsp, 'build_shared_fonts', fonts), patch.object(nsp, 'PROG'):
+                with self.assertRaisesRegex(nsp.BuildError, 'host failed'):
+                    nsp.mac_host('python', REPO, work, {}, work / 'logs', NS(id=GAME))
+            self.assertEqual(stopped, [True])
+            self.assertFalse((work / 'logs/host_font_timing.json').exists())
+
+    def test_independent_builds_overlap_and_write_separate_wall_times(self):
+        nsp = script('build_ipa_from_nsp')
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d); barrier = threading.Barrier(2); budget = []
+            def host(*args):
+                barrier.wait(timeout=5); return work / 'tools/dmhost'
+            def fonts(py, repo, path, env, logs, cancel=None):
+                budget.append(env['J']); barrier.wait(timeout=5); return work / 'font'
+            with patch.object(nsp, 'build_mac_host', host), patch.object(nsp, 'build_shared_fonts', fonts), patch.object(nsp, 'PROG'):
+                result = nsp.mac_host('python', REPO, work, {'J': '8'}, work / 'logs', NS(id=GAME))
+            self.assertEqual(result, (work / 'tools/dmhost', work / 'font'))
+            self.assertEqual(budget, ['1'], 'cold make owns the CPU budget; fonts overlap on one worker')
+            timing = json.loads((work / 'logs/host_font_timing.json').read_text())
+            self.assertTrue(timing['parallel'])
+            self.assertGreaterEqual(timing['total_seconds'], max(timing['host_seconds'], timing['fonts_seconds']))
+            self.assertGreaterEqual(timing['child_cpu_seconds'], 0)
+
+    def test_font_failure_propagates_and_does_not_leave_a_success_record(self):
+        nsp = script('build_ipa_from_nsp')
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d); logs = work / 'logs'; logs.mkdir()
+            (logs / 'host_font_timing.json').write_text('old record')
+            with patch.object(nsp, 'build_mac_host', return_value=work / 'tools/dmhost'), patch.object(nsp, 'build_shared_fonts', side_effect=nsp.BuildError('font failed')), patch.object(nsp, 'PROG') as progress:
+                with self.assertRaisesRegex(nsp.BuildError, 'font failed'):
+                    nsp.mac_host('python', REPO, work, {}, logs, NS(id=GAME))
+                progress.end.assert_not_called()
+            self.assertFalse((logs / 'host_font_timing.json').exists())
 
 
 if __name__ == '__main__':

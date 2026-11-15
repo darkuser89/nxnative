@@ -83,12 +83,15 @@ endif
 OBJ_DIR = gen/$(GAME)/obj
 HOST_OBJ = $(foreach s,$(HOST_SRC),$(if $(filter ../gfx/%,$(s)),$(OBJ_DIR)/gfx/$(s:../gfx/%=%).o,$(OBJ_DIR)/host/$(s).o))   # the line's order: the link lays code out in it
 HOST_BIN = gen/$(GAME)/dmhost
-$(OBJ_DIR)/host/%.o: % Makefile ../mac/min_os.mk | $(GAME_H) $(MSL_H)
+$(OBJ_DIR)/host/%.o: % Makefile ../mac/min_os.mk | $(GAME_H)
 	@mkdir -p $(dir $@)
 	clang $(HOST_CFLAGS) -MMD -MP -c $< -o $@
-$(OBJ_DIR)/gfx/%.o: ../gfx/% Makefile ../mac/min_os.mk | $(GAME_H) $(MSL_H)
+$(OBJ_DIR)/gfx/%.o: ../gfx/% Makefile ../mac/min_os.mk | $(GAME_H)
 	@mkdir -p $(dir $@)
 	clang $(HOST_CFLAGS) -MMD -MP -c $< -o $@
+# Only this translation unit embeds the generated libraries. Other compiles can
+# start while Metal and the decoder libraries are still building.
+$(OBJ_DIR)/gfx/nvn/host_msl.m.o: $(MSL_H)
 $(HOST_BIN): $(HOST_OBJ) $(VPX_LIB) $(DAV1D_LIB) Makefile ../mac/min_os.mk
 	clang $(HOST_CFLAGS) -o $@ $(HOST_OBJ) $(VPX_LIB) $(DAV1D_LIB) $(HOST_FRAMEWORKS)
 	dsymutil $@

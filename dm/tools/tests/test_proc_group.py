@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace as NS
 import unittest
@@ -108,6 +109,14 @@ class Run(Tree):
         self.assertLess(secs, BOUND)
         self.assert_gone(w, c)
         self.assertEqual(self.marks(), ['INT'])   # the child got the interrupt, as a terminal's Ctrl-C gives it
+
+    def test_cancellation_event_stops_the_whole_group(self):
+        cancel = threading.Event()
+        r, secs, (w, c) = self.run_tree(stop=cancel.set, cancel=cancel)
+        self.assertIsInstance(r, nsp.BuildError)
+        self.assertLess(secs, BOUND)
+        self.assert_gone(w, c)
+        self.assertEqual(self.marks(), ['TERM'])
 
     def test_ignored_signals_end_in_sigkill(self):
         def interrupt(): raise KeyboardInterrupt

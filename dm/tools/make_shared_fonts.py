@@ -6,7 +6,7 @@ Mario Tennis Fever's 50 KB engine needs 56-60 KB for macOS's Arial Unicode as it
 (docs/reference/services.md, "Shared font stand-ins sized for the game's font engines"). So every cut drops the hinting (fpgm, prep, cvt and each glyph's instructions) and the layout tables but kerning, and
 holds the characters of its type only, as Nintendo's set splits them; each takes a name of its own, as a game can load several types into one engine.
 Usage: make_shared_fonts.py out_dir [source.ttf]; needs fontTools (pip install fonttools)"""
-import os, sys
+import concurrent.futures, multiprocessing, os, sys
 from fontTools import subset
 from fontTools.ttLib import TTFont
 
@@ -57,15 +57,25 @@ def cut(src, out, chars, name):
     f.save(out)
     return len(have), f['maxp'].numGlyphs
 
-def build(out_dir, src=SOURCE, letters=LETTERS):
+def build(out_dir, src=SOURCE, letters=LETTERS, *, jobs=None):
     os.makedirs(out_dir, exist_ok=True)
     sets = charsets()
-    for t, fn, name in TYPES:
-        chars, glyphs = cut(src, os.path.join(out_dir, fn), sets[t], name)
-        print('%s: type %d, %d characters, %d glyphs, %d bytes' % (fn, t, chars, glyphs, os.path.getsize(os.path.join(out_dir, fn))))
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import make_ext_font
-    make_ext_font.build(os.path.join(out_dir, EXT), letters)
+    workers = min(len(TYPES), max(1, jobs if jobs is not None else int(os.environ.get('J') or os.cpu_count() or 1)))
+    def report(t, fn, result):
+        chars, glyphs = result
+        print('%s: type %d, %d characters, %d glyphs, %d bytes' % (fn, t, chars, glyphs, os.path.getsize(os.path.join(out_dir, fn))))
+    if workers == 1:
+        for t, fn, name in TYPES: report(t, fn, cut(src, os.path.join(out_dir, fn), sets[t], name))
+        make_ext_font.build(os.path.join(out_dir, EXT), letters)
+    else:
+        # Glyph serialization is Python CPU work: threads share the GIL. Spawn
+        # isolated workers, each with its own TTFont and destination file.
+        with concurrent.futures.ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context('spawn')) as pool:
+            futures = [pool.submit(cut, src, os.path.join(out_dir, fn), sets[t], name) for t, fn, name in TYPES]
+            make_ext_font.build(os.path.join(out_dir, EXT), letters)
+            for (t, fn, _), future in zip(TYPES, futures): report(t, fn, future.result())
 
 if __name__ == '__main__':
     if len(sys.argv) < 2: sys.exit(__doc__ or 'usage: make_shared_fonts.py out_dir [source.ttf]')

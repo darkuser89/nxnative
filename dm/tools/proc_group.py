@@ -102,9 +102,10 @@ class Group:
             self.stragglers += members(self.pgid); self.stop()
         return self.p.returncode
 
-    def lines(self):
+    def lines(self, cancel=None):
         """The output of a group started with stdout=PIPE, a line at a time as text (universal newlines, undecodable bytes replaced: as text=True reads it). Ends at the end of
         the output, or drain seconds after the direct child's exit while a member still holds the pipe: those members are stopped then (stragglers) and the end follows.
+        An optional cancellation event stops this entire group, including when its caller runs on a worker thread.
         The direct child's exit is seen whether or not output comes; finish() then waits for the rest of the group"""
         out = self.p.stdout
         assert out is not None, 'lines() reads a group started with stdout=PIPE'
@@ -114,6 +115,7 @@ class Group:
         sel.register(fd, selectors.EVENT_READ)
         try:
             while True:
+                if cancel is not None and cancel.is_set() and not self.done: self.stop()
                 if sel.select(0.1):
                     data = os.read(fd, 65536)
                     if not data: break

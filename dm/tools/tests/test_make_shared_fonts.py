@@ -91,6 +91,23 @@ class Cuts(unittest.TestCase):
 
 @unittest.skipIf(not (os.path.isfile(msf.SOURCE) and os.path.isfile(msf.LETTERS)), "macOS's Arial Unicode and Arial Rounded Bold")
 class WholeSet(unittest.TestCase):
+    def test_parallel_set_matches_serial_font_tables(self):
+        # The timestamp and its checksum change when a font is saved later;
+        # every other byte of every table, including glyphs and metrics, must match.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); serial, parallel = root / 'serial', root / 'parallel'
+            msf.build(str(serial), jobs=1); msf.build(str(parallel), jobs=5)
+            for name in [fn for _, fn, _ in msf.TYPES] + [msf.EXT]:
+                with TTFont(serial / name) as a, TTFont(parallel / name) as b:
+                    assert a.reader is not None and b.reader is not None
+                    self.assertEqual(set(a.reader.keys()), set(b.reader.keys()), name)
+                    for tag in a.reader.keys():
+                        x, y = a.reader[tag], b.reader[tag]
+                        if tag == 'head':
+                            x = x[:8] + bytes(4) + x[12:20] + bytes(16) + x[36:]
+                            y = y[:8] + bytes(4) + y[12:20] + bytes(16) + y[36:]
+                        self.assertEqual(x, y, (name, tag))
+
     def test_the_set_from_macos_fonts(self):
         with tempfile.TemporaryDirectory() as d:
             msf.build(d)

@@ -33,7 +33,7 @@
 # unless ALLOW_OTHER_METAL / --allow-other-metal. Issue #242 reported corruption with another compiler; the cause is still unconfirmed.
 # Python 3.12+ is required for bounded archive mappings inside images. The Python running this file needs lz4, capstone 5.x, fonttools and zbic (and backports.zstd before Python 3.14); also needed: Xcode, xcodegen, zstd. SPIRV-Cross is the in-repo build. A first run takes 2 (Metroid Dread) to 10 minutes (Breath of the Wild: 5 of them the shader split), longer when shader libraries must be compiled; a repeat run with unchanged inputs takes about 20 s (Metroid Dread), mostly packing the IPA. Key values are never printed.
 # The console shows one line per stage ([k/n] stage, with a bar, done/total, percent, elapsed time and ETA where the work can be counted); the tools' own output goes only to logs/ (PROGRESS / --progress). --progress json writes newline-delimited JSON events to stdout.
-import ast, collections, contextlib, ctypes, errno, getpass, hashlib, importlib.util, json, os, re, shlex, shutil, signal, struct, subprocess, sys, tempfile, threading, time, types
+import ast, collections, concurrent.futures, contextlib, ctypes, errno, getpass, hashlib, importlib.util, json, os, re, shlex, shutil, signal, struct, subprocess, sys, tempfile, threading, time, types
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dm/tools"))
 import romfs as rfs
@@ -370,7 +370,7 @@ def ask(prompt, what):   # what: what is missing, for the error message
     return os.path.expanduser(s)
 
 
-def run(cmd, log, env=None, cwd=None, on_line=None, ok=(), fatal=True):
+def run(cmd, log, env=None, cwd=None, on_line=None, ok=(), fatal=True, cancel=None):
     """Run a subprocess with all its output written to log (the console shows the stage line instead: the shader build alone emits tens of thousands of compiler warnings);
     stop on a non-zero exit not in ok, printing the log's last lines. on_line: called with every output line (build_ipa.sh's own step lines move its stages on).
     fatal False: such an exit only prints those lines and returns its code (the caller ends the stage and goes on without what the command makes).
@@ -381,7 +381,7 @@ def run(cmd, log, env=None, cwd=None, on_line=None, ok=(), fatal=True):
     log.parent.mkdir(parents=True, exist_ok=True)
     tail = collections.deque(maxlen=40)
     with open(log, 'w') as f, proc_group.Group(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as g:
-        for line in g.lines():
+        for line in (g.lines(cancel=cancel) if cancel is not None else g.lines()):
             f.write(line); tail.append(line)
             if on_line:
                 try: on_line(line.rstrip('\n'))
@@ -1640,7 +1640,11 @@ def build_mac_host(repo, out, env, logs, g):
     and the macOS SDK) are as at the last build into out. The host runs the game's own arm64 code natively, so an Intel Mac stops here (GitHub issue #54)"""
     if not apple_silicon(): raise BuildError('this step boots the game in the Mac host, which runs the game\'s own arm64 code natively: it needs a Mac with Apple silicon, and this Mac has an Intel processor')
     host = repo / 'dm/host'
-    run(['make', '-s', f'GAME={g.id}', f'gen/{g.id}/game_profile.h', 'gen/vpx/libvpx.a', 'gen/dav1d/libdav1d.a', 'host_msl'], logs / 'mac_host_make.log', env=env, cwd=host)
+    cold = not out.is_file()
+    # With no output there is nothing to reuse: let make schedule the complete
+    # dependency graph, rather than finish every library before starting C/ObjC.
+    if cold: run(['make', '-s', f'GAME={g.id}', f'gen/{g.id}/dmhost'], logs / 'mac_host_build.log', env=env, cwd=host)
+    else: run(['make', '-s', f'GAME={g.id}', f'gen/{g.id}/game_profile.h', 'gen/vpx/libvpx.a', 'gen/dav1d/libdav1d.a', 'host_msl'], logs / 'mac_host_make.log', env=env, cwd=host)
     built = host / f'gen/{g.id}/dmhost'
     dry = subprocess.run(['make', '-n', '-B', f'GAME={g.id}', f'gen/{g.id}/dmhost'], env=env, cwd=host, capture_output=True, text=True)
     cmd = [l for l in dry.stdout.splitlines() if l.startswith('clang') and f' -o gen/{g.id}/' in l]   # the host's compiles and its link, not the libraries'
@@ -1657,7 +1661,7 @@ def build_mac_host(repo, out, env, logs, g):
     decoder = fingerprint('oodle-host-v1', common, ('files', [p for p in srcs if p != chain]), chain_text)
     if out.is_file() and reused(kf, key) is not None and decoder_host_key(out) == decoder: return out
     rmtree(kf); out.parent.mkdir(parents=True, exist_ok=True)
-    run(['make', '-s', f'GAME={g.id}', f'gen/{g.id}/dmhost'], logs / 'mac_host_build.log', env=env, cwd=host)
+    if not cold: run(['make', '-s', f'GAME={g.id}', f'gen/{g.id}/dmhost'], logs / 'mac_host_build.log', env=env, cwd=host)
     part, dsym = out.with_name(out.name + '.partial'), Path(f'{out}.dSYM')
     shutil.copy2(built, part); os.replace(part, out)
     rmtree(dsym)
@@ -2705,21 +2709,51 @@ def build_env_file(work, env_file, motion):
     return str(f)
 
 
-def mac_host(py, repo, work, env, logs, g):
-    """The stage "Mac host" of a Mac-only build or a Mac app (PLATFORM 'mac', 'mac-app'): the Mac host for the profile (build_mac_host, into <id>_build/tools/dmhost, where the run-time captures
-    build it too; DM_GAMES_DIR / DM_GAMES_FIRST in env pick a provisional or derived profile) and the button-icon font the host gives a game for the Nintendo extension shared font
-    and the shared-font stand-ins (make_shared_fonts.py: one per type, into <id>_build/font, made again when the tools or the source font changed). Returns (host, font folder)"""
-    PROG.stage('Mac host', step='building')
-    host = build_mac_host(repo, work / 'tools/dmhost', env, logs, g)
-    PROG.set(step='shared fonts')
+def build_shared_fonts(py, repo, work, env, logs, cancel=None):
+    """Shared-font stand-ins, independent of the host binary and reused by their existing input key."""
     font, kf = work / 'font', work / 'font.key'
     src = Path(os.environ.get('STD_FONT') or '/System/Library/Fonts/Supplemental/Arial Unicode.ttf')
     st = src.stat() if src.is_file() else None
     key = fingerprint(('files', [repo / 'dm/tools/make_shared_fonts.py', repo / 'dm/tools/make_ext_font.py']), ('font', str(src), st and st.st_size, st and int(st.st_mtime)))
     if not ((font / 'korean.ttf').is_file() and reused(kf, key) is not None):
         rmtree(kf); rmtree(font); font.mkdir(parents=True, exist_ok=True)
-        run([py, repo / 'dm/tools/make_shared_fonts.py', font, src], logs / 'make_shared_fonts.log', env=env)
+        run([py, repo / 'dm/tools/make_shared_fonts.py', font, src], logs / 'make_shared_fonts.log', env=env, cancel=cancel)
         kf.write_text(f'{key}\n')
+    return font
+
+
+def mac_host(py, repo, work, env, logs, g):
+    """The Mac host and its independent shared fonts, built concurrently. Returns (host, font folder)."""
+    PROG.stage('Mac host', step='building host and shared fonts')
+    start, cpu, load = time.perf_counter(), os.times(), os.getloadavg()
+    logs.mkdir(parents=True, exist_ok=True)
+    for name in ('host_font_timing.json', 'host_font_timing.json.partial'): (logs / name).unlink(missing_ok=True)
+    timings = {}
+    def component(name, fn, *args):
+        t = time.perf_counter()
+        result = fn(*args)
+        timings[name] = round(time.perf_counter() - t, 6)
+        return result
+    # Cold make already fills its worker budget. One font process overlaps its
+    # tail without spawning five more CPU workers; standalone font builds and
+    # font-only refreshes can still use the font tool's parallel path.
+    font_env = dict(env, J='1') if not (work / 'tools/dmhost').is_file() else env
+    cancel = threading.Event()
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        fonts = pool.submit(component, 'fonts_seconds', build_shared_fonts, py, repo, work, font_env, logs, cancel)
+        try:
+            host = component('host_seconds', build_mac_host, repo, work / 'tools/dmhost', env, logs, g)
+            if not fonts.done(): PROG.set(step='shared fonts')
+            font = fonts.result()   # propagate a font failure; never pack a partial set
+        finally: cancel.set()   # a host failure or interrupt must stop the background font process group too
+    end = os.times()
+    timings.update(format=1, parallel=True, total_seconds=round(time.perf_counter() - start, 6),
+                   self_cpu_seconds=round(end.user + end.system - cpu.user - cpu.system, 6),
+                   child_cpu_seconds=round(end.children_user + end.children_system - cpu.children_user - cpu.children_system, 6),
+                   load_start=load, load_end=os.getloadavg())
+    part = logs / 'host_font_timing.json.partial'
+    part.write_text(json.dumps(timings, indent=2) + '\n')
+    os.replace(part, logs / 'host_font_timing.json')
     PROG.end(str(host))
     return host, font
 
