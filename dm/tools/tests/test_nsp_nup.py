@@ -2,6 +2,7 @@
 and the script asks for no keys. The NUPs are written here (SPEC v1, https://github.com/a55uka/nup). The run stops at the prerequisite check; no game files, keys or Xcode needed."""
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -39,8 +40,8 @@ def tlv(recs):
     return b''.join(struct.pack('<HHI', t, 0, len(v)) + v for t, v in recs)
 
 
-def write_nup(path, packages, *, update_flags=0):
-    """packages: [(kind, title ID, version, {'exefs': {name: bytes}, 'romfs': {path: bytes}}, meta bytes)] → a NUP file, every file of 200 bytes or more zstd-compressed"""
+def write_nup(path, packages, *, update_flags=0, compress=True):
+    """packages: [(kind, title ID, version, {'exefs': {name: bytes}, 'romfs': {path: bytes}}, meta bytes)] → a NUP file; by default files of 200 bytes or more are zstd-compressed"""
     dirs, files, slots, pool = [], [], [], bytearray()
     def walk(name, tree):   # tree: {name: bytes or dict}; dirs pre-order, children contiguous and sorted
         d = len(dirs); dirs.append([name, 0, 0])
@@ -77,7 +78,7 @@ def write_nup(path, packages, *, update_flags=0):
     blob, blobs = pos, []
     ext = []
     for n, data in files:
-        stored, codec = (zstd.compress(data), 1) if len(data) >= 200 else (data, 0)
+        stored, codec = (zstd.compress(data), 1) if compress and len(data) >= 200 else (data, 0)
         if not data: ext.append((0, 0, 0)); continue
         ext.append((pos, len(stored), codec)); blobs.append((pos, stored)); pos = (pos + len(stored) + 15) // 16 * 16
     toc = bytearray(struct.pack('<4sIQQQQQ', b'TOC\x01', len(recs), len(dirs), len(files), pool_off, len(pool), 0))
@@ -145,6 +146,36 @@ class ExeFSNames(unittest.TestCase):
 
 
 class Read(Base):
+    def test_prefetched_raw_copy_checks_contents_and_short_reads(self):
+        data = bytes(range(251)) * 17
+        write_nup(self.path, [(0, TID, 0, {'romfs': {'blob': data}}, b'')], compress=False)
+        with self.open() as n, mock.patch.object(pack_nup, 'PREFETCH_MIN', 1), mock.patch.object(pack_nup, 'COPY_CHUNK', 128):
+            index = next(i for i, row in enumerate(n.files) if row[0] == b'blob')
+            original = os.pread
+            def short(fd, length, offset): return original(fd, min(length, 19), offset)
+            for reader in (original, short):
+                with self.subTest(reader=reader.__name__), mock.patch.object(os, 'pread', reader):
+                    output = io.BytesIO()
+                    self.assertEqual(n.copy(index, output), len(data))
+                    self.assertEqual(output.getvalue(), data)
+            offset = n.files[index][3]
+            def truncated(fd, length, start): return original(fd, length, start) if start < offset + 128 else b''
+            with mock.patch.object(os, 'pread', truncated), self.assertRaisesRegex(pack_nup.Error, 'SHA-256'):
+                n.copy(index, io.BytesIO())
+            with self.path.open('r+b') as out: out.seek(offset + 200); out.write(b'\xff')
+            with self.assertRaisesRegex(pack_nup.Error, 'SHA-256'): n.copy(index, io.BytesIO())
+
+    def test_prefetch_stops_on_write_failure(self):
+        data = bytes(range(251)) * 17
+        write_nup(self.path, [(0, TID, 0, {'romfs': {'blob': data}}, b'')], compress=False)
+        n = self.open()
+        index = next(i for i, row in enumerate(n.files) if row[0] == b'blob')
+        output = mock.Mock()
+        output.write.side_effect = OSError('write failed')
+        with mock.patch.object(pack_nup, 'PREFETCH_MIN', 1), mock.patch.object(pack_nup, 'COPY_CHUNK', 128):
+            with self.assertRaisesRegex(OSError, 'write failed'): n.copy(index, output)
+        n.close()   # no live view or background reader may outlive the failed copy
+
     def test_scan(self):
         n = self.open()
         app, base, vers, dlc = pack_nup.scan(n)

@@ -18,7 +18,7 @@
 # or, after a packer update, an image whose bytes check against the container's hashes.
 # Needs the zstd module: compression.zstd (Python 3.14+) or backports.zstd, as the NSP script.
 # Usage: pack_nup.py <game.nup> [--version N] [--work-dir DIR]   (exit 1 on error)
-import argparse, hashlib, mmap, os, shutil, struct, sys
+import argparse, concurrent.futures, hashlib, mmap, os, shutil, struct, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'dm/tools'))
 import romfs_image
@@ -43,7 +43,30 @@ KINDS = ('base', 'update', 'addon', 'addon_update', 'system')
 STANDALONE = 1   # package flags bit 0: an update in a container without a base
 T_NACP, T_ICON, T_LICONS = 2, 3, 10
 ARTIFACTS = romfs_image.ARTIFACTS   # dump-tool files a producer may have kept (SPEC §6.3): not game files
+COPY_CHUNK = 8 << 20
+PREFETCH_MIN = 64 << 20   # small files stay on the mapped path; large raw files overlap read I/O with hashing and writing
 NO_BASE = 'no base game in this NUP: its update is taken as the whole game (if the game then stops on missing files, the update holds only what changed: pack a NUP with the base game)'
+
+
+def copy_prefetched(path, offset, size, put):
+    """Read one block ahead while the caller hashes/writes the previous one; never submit an entire file."""
+    with open(path, 'rb', buffering=0) as source, concurrent.futures.ThreadPoolExecutor(1) as pool:
+        def read(start, length):
+            data = os.pread(source.fileno(), length, start)
+            while len(data) < length:   # a short read need not be EOF
+                extra = os.pread(source.fileno(), length - len(data), start + len(data))
+                if not extra: break   # the caller's size and SHA-256 checks reject a truncated file
+                data += extra
+            return data
+        end = offset + size
+        pending = pool.submit(read, offset, min(COPY_CHUNK, size))
+        for start in range(offset, end, COPY_CHUNK):
+            data = pending.result()
+            if len(data) != min(COPY_CHUNK, end - start):
+                put(data); return   # stop at EOF; the caller rejects the incomplete size/hash
+            following = start + COPY_CHUNK
+            if following < end: pending = pool.submit(read, following, min(COPY_CHUNK, end - following))
+            put(data)
 
 
 class Package:
@@ -158,18 +181,23 @@ class Nup:
         def put(b):
             nonlocal n
             h.update(b); out.write(b); n += len(b)
-        if codec == 0:
-            for p in range(eoff, eoff + esz, 8 << 20): put(view[p:min(p + (8 << 20), eoff + esz)])
-        elif size:
-            if zstd is None: raise Error('reading a NUP needs the zstd module: compression.zstd (Python 3.14+) or pip install backports.zstd')
-            d = zstd.ZstdDecompressor()
-            try:
-                for p in range(eoff, eoff + esz, 4 << 20):
-                    put(d.decompress(view[p:min(p + (4 << 20), eoff + esz)]))
-                    if n > size: break
-            except zstd.ZstdError as e: raise Error(f'{self.path}: {name.decode(errors="replace")}: {e}') from e
-            if not d.eof: n = -1
-        view.release()
+        try:
+            if codec == 0:
+                # Serial mapped reads, hashing and writes left the SSD idle between operations
+                # on Star Fox's 15.6 GB data.zip. pread releases the GIL while fetching the next block.
+                if esz >= PREFETCH_MIN and hasattr(os, 'pread'): copy_prefetched(self.path, eoff, esz, put)
+                else:
+                    for p in range(eoff, eoff + esz, COPY_CHUNK): put(view[p:min(p + COPY_CHUNK, eoff + esz)])
+            elif size:
+                if zstd is None: raise Error('reading a NUP needs the zstd module: compression.zstd (Python 3.14+) or pip install backports.zstd')
+                d = zstd.ZstdDecompressor()
+                try:
+                    for p in range(eoff, eoff + esz, 4 << 20):
+                        put(d.decompress(view[p:min(p + (4 << 20), eoff + esz)]))
+                        if n > size: break
+                except zstd.ZstdError as e: raise Error(f'{self.path}: {name.decode(errors="replace")}: {e}') from e
+                if not d.eof: n = -1
+        finally: view.release()
         if n != size or h.digest() != sha: raise Error(f'{self.path}: {name.decode(errors="replace")} does not match its size or SHA-256 (damaged file)')
         return n
 
