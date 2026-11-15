@@ -155,13 +155,17 @@ def strip_detritus(app):   # the "._name" files a copy from or onto an exFAT vol
 
 def sign(app, identity, codesign, nested=()):   # the new data bundles and the inner host first, then the bundle (its resources and the launcher); no --options runtime (see the top)
     strip_detritus(app)   # before codesign reads the bundle, so that a build folder or an output folder on exFAT is not a signing failure
+    # Ask for both resource hashes in one read. With SHA-256 alone, Apple's signer
+    # rereads every resource to construct the legacy SHA-1 seal. SHA-256 remains
+    # present; no resource is omitted (Security signer.cpp, buildResources).
+    command = [codesign, '--force', '--sign', identity, '--digest-algorithm=sha1,sha256']
     for target in (*nested, app / 'Contents/MacOS/dmhost', app):
-        try: run([codesign, '--force', '--sign', identity, target])
+        try: run([*command, target])
         except SystemExit as e:
             if not any(s in str(e) for s in ('detritus', '._', 'not signed at all')): raise
             subprocess.run(['xattr', '-cr', str(app)], capture_output=True)   # Finder information or resource forks on copied files: codesign refuses them
             strip_detritus(app)
-            run([codesign, '--force', '--sign', identity, target])
+            run([*command, target])
     strip_detritus(app)   # codesign sets an attribute on what it signs, which is a "._name" file again on exFAT: the signature still verifies without it, and a later --force would refuse it
 
 
@@ -350,8 +354,10 @@ def pack(a):
     romfs, msl, aoc = Path(a.romfs), Path(a.msl), Path(a.aoc) if a.aoc else None
     # each source is probed on its own, as they may lie on different volumes; cp -c copies what it cannot clone, so a probe decides only the free-space check and the step line
     trees, lists = {'romfs': romfs, 'aoc': aoc}, {'mods': mods, 'msl': msls, 'pso': pso}
-    clone = {k: bool(d) and can_clone(d, res) for k, d in trees.items()} | {k: bool(ps) and can_clone(ps[0], res) for k, ps in lists.items()}
-    if is_chain_library(msl): clone['msl'] = False   # copy_msl writes it, which the free-space check below counts
+    # copy_msl rewrites chain images rather than cloning them. Do not probe their source:
+    # clonefile can change its ctime after the reuse key was read, invalidating the next pack.
+    clone = {k: bool(d) and can_clone(d, res) for k, d in trees.items()} | {
+        k: bool(ps) and not (k == 'msl' and is_chain_library(msl)) and can_clone(ps[0], res) for k, ps in lists.items()}
     need = sum(tree_bytes(d) for k, d in trees.items() if d and not clone[k]) + sum(p.stat().st_size for k, ps in lists.items() if not clone[k] for p in ps)
     if need:
         free = vol_space.free_bytes(res)

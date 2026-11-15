@@ -236,6 +236,24 @@ class PackReuse(unittest.TestCase):
         (source / 'marker').write_text('new bytes'); romfs_image.pack(source, image)
         self.assert_repacked()
 
+    def test_packed_shader_image_keeps_its_identity_and_reuses_the_app(self):
+        # A clonefile probe can change source ctime even when its result is discarded.
+        library = self.tmp / 'b-0123456789ab'
+        pack_app.shader_lib.write({'k.metallib': b'library', 'inputs.tsv': b'stamp'}, str(library) + '.img')
+        image = Path(str(library) + '.img')
+        self.args.msl = str(library)
+        def probe(source, destination):
+            if source == image:
+                s = source.stat()
+                os.utime(source, ns=(s.st_atime_ns, s.st_mtime_ns + 1000000000))
+            return False
+        self.clone.side_effect = probe
+        before = pack_app.file_row(image, True)
+        self.pack()
+        self.assertEqual(pack_app.file_row(image, True), before)
+        self.assertEqual((Path(self.args.out) / 'Contents/Resources/msl' / image.name).read_bytes(), image.read_bytes())
+        self.assert_reused()
+
     def test_all_metadata_sign_identity_and_selected_paths_invalidate(self):
         self.pack()
         for name, value in [('name', 'New Game'), ('version', '2.0'), ('bundle_id', 'org.test.new'), ('category', 'public.app-category.action-games'),
@@ -701,6 +719,18 @@ class App(unittest.TestCase):
         self.assertIn('cdhash', seal['PlugIns/GameData.bundle'])
         self.assertFalse(any(k.startswith('PlugIns/GameData.bundle/') for k in seal))
 
+    def test_single_pass_signing_keeps_sha256_and_rejects_tampered_resources(self):
+        bundle = self.tmp / 'Tampered.bundle'
+        subprocess.run(['/bin/cp', '-R', Path(self.app) / 'Contents/PlugIns/GameData.bundle', bundle], check=True)
+        seal = plistlib.loads((bundle / 'Contents/_CodeSignature/CodeResources').read_bytes())
+        name, hashes = next(iter(seal['files2'].items()))
+        data = bundle / 'Contents' / name
+        self.assertEqual(hashes['hash2'], hashlib.sha256(data.read_bytes()).digest())
+        self.assertEqual(hashes['hash'], hashlib.sha1(data.read_bytes()).digest())
+        subprocess.run(['codesign', '--verify', '--strict', bundle], check=True, capture_output=True)
+        data.write_bytes(data.read_bytes() + b'tampered')
+        self.assertNotEqual(subprocess.run(['codesign', '--verify', '--strict', bundle], capture_output=True).returncode, 0)
+
     def test_data_bundles_repacked(self):
         # another host: the data bundles are cloned with their signatures; a data file changed in the app since: its bundle is made again. Each result verifies whole (--deep reads every file)
         out, host = self.tmp / 'Repack.app', self.tmp / 'host-other'
@@ -798,7 +828,9 @@ class App(unittest.TestCase):
         with mock.patch.object(pack_app, 'can_clone', can_clone), mock.patch.object(pack_app, 'tree_bytes', tree_bytes), \
              mock.patch.object(shutil, 'disk_usage', lambda p: types.SimpleNamespace(free=(1 << 30) + lists - 1)), mock.patch.object(pack_app.vol_space, 'important_bytes', lambda p: None), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(SystemExit, 'the app needs'): pack_app.pack(a)
-        self.assertEqual(len(probed), 5); self.assertEqual(counted, [(self.tmp / 'aoc').resolve()])
+        self.assertEqual(len(probed), 4)   # the chain image is rewritten, so its cloneability is irrelevant
+        self.assertNotIn(Path(pack_app.shader_lib.image_of(a.msl)), probed)
+        self.assertEqual(counted, [(self.tmp / 'aoc').resolve()])
 
     def test_copies(self):   # another volume (no APFS clone): plain copies, the same layout; a new app replaces the old one whole
         with mock.patch.object(pack_app, 'can_clone', lambda *a: False), mock.patch.object(pack_app, 'sign', lambda *a: None), mock.patch('sys.stdout'):
