@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
@@ -863,6 +864,18 @@ class SplitShaders(Base):
 
 
 class RewriteWorkers(Base):
+    def test_rewrite_worker_budget_follows_text_size_for_nso_and_nro(self):
+        def module(name, size, nro=False):
+            h = bytearray(0x80)
+            if nro: h[0x10:0x14] = b'NRO0'; struct.pack_into('<I', h, 0x24, size)
+            else: h[:4] = b'NSO0'; struct.pack_into('<I', h, 0x18, size)
+            p = self.tmp / name; p.write_bytes(h); return p
+        src = {'large': module('large', 10000), 'small': module('small', 100), 'nro': module('nro', 100, True)}
+        self.assertEqual(nsp.rewrite_budgets(src, 8), {'large': 8, 'small': 1, 'nro': 1})
+        src['large'] = module('large', 100)
+        self.assertEqual(nsp.rewrite_budgets(src, 8), dict.fromkeys(src, 5))
+        self.assertEqual(nsp.rewrite_budgets({'missing': self.tmp / 'absent'}, 8), {'missing': 8})
+
     def test_explicit_workers_override_the_automatic_module_budget(self):
         g = game.Game(self.src)
         for value, expected in (('1', '1'), ('3', '3'), ('', '14')):

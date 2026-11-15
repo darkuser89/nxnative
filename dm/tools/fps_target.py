@@ -79,8 +79,9 @@ def find(img, text_end, ro_off, data_off):
     word = lambda a: struct.unpack_from('<I', img, a)[0]
     global_of = globals_of(img)
     readers, stores = {}, {}
-    for i in range(0, text_end, 4):
-        u = word(i)
+    # Decode the linear pass in C; random look-backs still use the checked word reader.
+    for index, (u,) in enumerate(struct.iter_unpack('<I', memoryview(img)[:(text_end + 3) & ~3])):
+        i = 4 * index
         if (u & 0xFFC00000) == 0xBD400000:   # ldr sT, [xB, #F]
             t, b, f = u & 31, (u >> 5) & 31, ((u >> 10) & 0xFFF) * 4
             conv = next((k for k in range(i + 4, min(text_end, i + 24), 4) if (word(k) & 0xFFFFFFE0) == 0x5E21D800 | t << 5), None)   # scvtf sC, sT

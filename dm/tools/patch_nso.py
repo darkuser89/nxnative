@@ -922,27 +922,28 @@ kinds = {}
 # Spin wait candidates (see "Spin waits" below): backward direct branches (b, b.cond, cbz / cbnz, tbz / tbnz) at most SPIN_WIN bytes back, by target
 SPIN_WIN, SPIN_TOPS = 512, {0x16, 0x17, 0x54, 0x34, 0x35, 0xB4, 0xB5, 0x36, 0x37, 0xB6, 0xB7}
 spin_cand = {}
-for o in (o for s, e in CODE_RANGES for o in range(s, e, 4)):
-    w = struct.unpack_from('<I', IMG, o)[0]
-    if w >> 24 in SPIN_TOPS:
-        t = w >> 24
-        if t in (0x16, 0x17): d = ((w & 0x3FFFFFF) - (1 << 26)) * 4
-        elif t & 0x7E == 0x36: d = (((w >> 5) & 0x3FFF) - (1 << 14)) * 4 if w & 0x40000 else 4
-        elif t == 0x54: d = (((w >> 5) & 0x7FFFF) - (1 << 19)) * 4 if w & 0x800000 and not w & 0x10 else 4
-        else: d = (((w >> 5) & 0x7FFFF) - (1 << 19)) * 4 if w & 0x800000 else 4
-        if -SPIN_WIN <= d <= 0: spin_cand.setdefault(o + d, []).append(o)
-    if w & 0xFFE0001F == 0xD4000001: kinds[o] = ('svc', (w >> 5) & 0xFFFF); continue
-    if w & 0xFFFFFFE0 == 0xD53BD040: kinds[o] = ('tpidr_r', None); continue
-    if w & 0xFFFFFFE0 == 0xD51BD040: kinds[o] = ('tpidr_w', None); continue
-    if w & 0xFFFFFFE0 == 0xD53BD060: kinds[o] = ('tpidrro_r', None); continue
-    if w & 0xFFFFFFE0 == 0xD53BE020: kinds[o] = ('cntpct', w & 31); continue
-    if w & 0xFFFFFFE0 == 0xD53BE040: kinds[o] = ('cntvct', w & 31); continue
-    # mrs xN, ctr_el0 (cache type): the Apple kernel does not expose it to user mode (SIGILL); SDK 16's nn::os::FlushDataCache reads it for the cache line size
-    if w & 0xFFFFFFE0 == 0xD53B0020: kinds[o] = ('ctr', w & 31); continue
-    # sub sp, sp, xN (extended register, LSL #0): sp may end up misaligned, which Horizon allows and Apple's kernel does not (site_sp_align); with x18 it is an x18 site (site_sp)
-    if w & 0xFFE0FFFF == 0xCB2063FF and (w >> 16) & 31 != 18: kinds[o] = ('sp_align', (w >> 16) & 31); continue
-    if o in x18: kinds[o] = ('x18', None)
-
+# Decode each instruction word once in C, preserving the exact code ranges.
+for scan_lo, scan_hi in CODE_RANGES:
+    for scan_index, (w,) in enumerate(struct.iter_unpack('<I', memoryview(IMG)[scan_lo:scan_lo + ((scan_hi - scan_lo + 3) & ~3)])):
+        o = scan_lo + 4 * scan_index
+        if w >> 24 in SPIN_TOPS:
+            t = w >> 24
+            if t in (0x16, 0x17): d = ((w & 0x3FFFFFF) - (1 << 26)) * 4
+            elif t & 0x7E == 0x36: d = (((w >> 5) & 0x3FFF) - (1 << 14)) * 4 if w & 0x40000 else 4
+            elif t == 0x54: d = (((w >> 5) & 0x7FFFF) - (1 << 19)) * 4 if w & 0x800000 and not w & 0x10 else 4
+            else: d = (((w >> 5) & 0x7FFFF) - (1 << 19)) * 4 if w & 0x800000 else 4
+            if -SPIN_WIN <= d <= 0: spin_cand.setdefault(o + d, []).append(o)
+        if w & 0xFFE0001F == 0xD4000001: kinds[o] = ('svc', (w >> 5) & 0xFFFF); continue
+        if w & 0xFFFFFFE0 == 0xD53BD040: kinds[o] = ('tpidr_r', None); continue
+        if w & 0xFFFFFFE0 == 0xD51BD040: kinds[o] = ('tpidr_w', None); continue
+        if w & 0xFFFFFFE0 == 0xD53BD060: kinds[o] = ('tpidrro_r', None); continue
+        if w & 0xFFFFFFE0 == 0xD53BE020: kinds[o] = ('cntpct', w & 31); continue
+        if w & 0xFFFFFFE0 == 0xD53BE040: kinds[o] = ('cntvct', w & 31); continue
+        # mrs xN, ctr_el0 (cache type): the Apple kernel does not expose it to user mode (SIGILL); SDK 16's nn::os::FlushDataCache reads it for the cache line size
+        if w & 0xFFFFFFE0 == 0xD53B0020: kinds[o] = ('ctr', w & 31); continue
+        # sub sp, sp, xN (extended register, LSL #0): sp may end up misaligned, which Horizon allows and Apple's kernel does not (site_sp_align); with x18 it is an x18 site (site_sp)
+        if w & 0xFFE0FFFF == 0xCB2063FF and (w >> 16) & 31 != 18: kinds[o] = ('sp_align', (w >> 16) & 31); continue
+        if o in x18: kinds[o] = ('x18', None)
 # Take the instruction table per function, find the windows and jump tables
 import bisect
 def func_of(a):
@@ -1937,20 +1938,22 @@ def spin_region(T, bes):
     through stores bring in a register that a pass changes, the region is looked for once more with every store ending its path, as before stores could be part of one.
     A lock sequence at T is one node of a poll that it heads (its own branches back to T stay inside it); when there is no such poll, T is the head of the sequence's own retry
     loop (a lock's wait for its holder, ld(a)xr; cbnz <the load>), found as plain instructions as before the lock rules"""
+    hi = max(bes)
+    if any(s < hi + 4 and T < e for s, e in DATA_BLOCKS) or not spin_quick(T, hi): return None
     lk = spin_lock(T)
     for head in (True, False) if lk and lk[0] in ('acq', 'rel') else (True,):
         ban = set()
         for _ in range(8):
-            g = spin_region1(T, bes, ban, True, head)
+            g = spin_region1(T, bes, ban, True, head, checked=True)
             if not isinstance(g, set): break
             ban |= g
-        old = spin_region1(T, bes, set(), False, head)   # the region without stores, which the search took before: the wider one only when it covers its back-edges
+        old = spin_region1(T, bes, set(), False, head, checked=True)   # the region without stores, which the search took before: the wider one only when it covers its back-edges
         g = g if isinstance(g, dict) and (not old or old['valid'] <= g['valid']) else old
         if g: break
     return g
-def spin_region1(T, bes, ban, stores, head):
+def spin_region1(T, bes, ban, stores, head, checked=False):
     hi = max(bes)
-    if any(s < hi + 4 and T < e for s, e in DATA_BLOCKS) or not spin_quick(T, hi): return None
+    if not checked and (any(s < hi + 4 and T < e for s, e in DATA_BLOCKS) or not spin_quick(T, hi)): return None
     nodes, back, bad, inner = {}, set(), set(), set()
     todo = [T]
     while todo:
@@ -2091,7 +2094,12 @@ def find_spin_regions():
     heads = []
     for found in in_parallel(spin_heads_with_region, [(first, step) for first in range(step)]):
         heads += found
-    return [spin_region(T, spin_cand[T]) for T in sorted(heads)]
+    regions = []
+    for T in sorted(heads):
+        region = spin_region(T, spin_cand[T])
+        assert region is not None, f'spin region {T:#x} did not repeat on the unchanged image'
+        regions.append(region)
+    return regions
 
 spin_regions = find_spin_regions()   # all found on the unchanged image first: emitting patches back-edges
 spin_sites = [(g['T'], sorted(g['valid']), sum(len(g['nodes'][a]['ins']) for a in g['R'])) for g in spin_regions]

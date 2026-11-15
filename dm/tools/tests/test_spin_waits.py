@@ -5,6 +5,7 @@ import re
 import struct
 import sys
 import unittest
+from unittest import mock
 
 from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
 from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG
@@ -33,12 +34,15 @@ POLL = [0xb4000434, 0xb901028b, 0xb940012e, 0x710005df, 0x54ffffc0, 0x885ffd2e, 
         0x1a9f37ed, 0x14000002, 0xd5033f5f, 0x885f7d2f, 0x710005ff, 0x54ffffa1, 0x880ffd3f, 0x35ffff8f, 0x34fffc0e, 0xd65f03c0]
 
 
-def region(words, T, bes):
+def region_scope(words):
     md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); md.detail = True
     scope = {'re': re, 'struct': struct, 'ARM64_OP_IMM': ARM64_OP_IMM, 'ARM64_OP_MEM': ARM64_OP_MEM, 'ARM64_OP_REG': ARM64_OP_REG,
              'IMG': struct.pack('<' + 'I' * len(words), *words) + bytes(64), 'md': md, 'spin_dec': {}, 'DATA_BLOCKS': [], 'spin_touched': set()}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(TOOLS / 'patch_nso.py'), 'exec'), scope)
-    return scope['spin_region'](T, bes)
+    return scope
+
+def region(words, T, bes):
+    return region_scope(words)['spin_region'](T, bes)
 
 
 def patched(**at):
@@ -48,6 +52,15 @@ def patched(**at):
 
 
 class SpinWaits(unittest.TestCase):
+    def test_unreachable_head_is_rejected_before_lock_and_retry_analysis(self):
+        scope = region_scope([0xd65f03c0, 0x17ffffff])   # ret; b <ret>: no path to the back-edge
+        quick = mock.Mock(wraps=scope['spin_quick'])
+        with mock.patch.dict(scope, spin_quick=quick, spin_lock=mock.Mock(side_effect=AssertionError('must reject first')),
+                             spin_region1=mock.Mock(side_effect=AssertionError('must reject first'))):
+            self.assertIsNone(scope['spin_region'](0, [4]))
+        quick.assert_called_once_with(0, 4)
+
+
     def test_lock_poll_without_clrex(self):
         # The same poll as Breath of the Wild 1.6.0's compiler writes it (main+0x12c0e48): the acquire's failed test and the release's failed compare go straight back to
         # the exclusive load (0x18 cbnz w14, L1; 0x74 b.ne U), no clrex; two nops keep the branches below in place

@@ -1495,6 +1495,23 @@ def provisional_modules(g, exe_dir, nros):
     return set_keys(g, {'modules': (' '.join(mods), f'the NROs the game loads at run time import from {why}, which main does not')} if add else {}, 'After the NRO collection', edit=row)
 
 
+def rewrite_budgets(src, cores):
+    """Share the existing two-core-count worker allowance by text size, capped per module.
+
+    Header reads choose scheduling only; patch_nso still validates the complete module.
+    Unknown/unreadable headers get one unit of weight rather than bypassing validation.
+    """
+    weights = {}
+    for name, path in src.items():
+        try:
+            with open(path, 'rb') as f: h = f.read(0x80)
+            size = struct.unpack_from('<I', h, 0x18)[0] if h[:4] == b'NSO0' else struct.unpack_from('<I', h, 0x24)[0] if h[0x10:0x14] == b'NRO0' else 1
+        except (OSError, struct.error): size = 1
+        weights[name] = max(1, size)
+    total = max(1, sum(weights.values()))
+    return {name: max(1, min(cores, 2 * cores * size // total)) for name, size in weights.items()}
+
+
 def rewrite(py, repo, exe_dir, out, env, logs, g, provisional=False):
     """patch_nso.py on every code module (each writes its own <module>.* files, all the same build_src.sha256 line), each with its log, as many at once as the Mac has cores.
     The modules are the profile's and the NROs the game registers (collect_nros; nro.tsv beside them lists those); a provisional profile first gets the subsdks those NROs import from, and its build row every module it lists (provisional_modules).
@@ -1525,13 +1542,12 @@ def rewrite(py, repo, exe_dir, out, env, logs, g, provisional=False):
     if manifest.is_file(): shutil.copyfile(manifest, tmp / 'nro.tsv')   # refused-only manifests preserve the game's offline registration path too
     PROG.set(step=', '.join(mods) + (f' and {len(nros)} NROs' if nros else ''), done=0, total=len(names), unit='modules')
     procs, logf, todo, cores = {}, {}, list(names), max(2, os.cpu_count() or 4)
-    jobs = max(1, min(cores, 2 * cores // max(1, len(names))))   # patch_nso.py workers per module, so parallel rewrites don't oversubscribe
-    rewrite_env = dict(env, DM_REWRITE_J=str(workers if workers is not None else jobs))
+    jobs = rewrite_budgets(src, cores) if workers is None else {m: workers for m in names}
     try:
         while todo or procs:
             while todo and len(procs) < cores:
                 m = todo.pop(0); logf[m] = open(logs / f'rewrite_{m}.log', 'w')
-                procs[m] = subprocess.Popen([str(py), str(repo / 'dm/tools/patch_nso.py'), str(src[m]), str(tmp), m], env=rewrite_env, stdout=logf[m], stderr=subprocess.STDOUT)
+                procs[m] = subprocess.Popen([str(py), str(repo / 'dm/tools/patch_nso.py'), str(src[m]), str(tmp), m], env=dict(env, DM_REWRITE_J=str(jobs[m])), stdout=logf[m], stderr=subprocess.STDOUT)
             for m in [m for m in procs if procs[m].poll() is not None]:
                 p = procs.pop(m); logf[m].close(); PROG.set(done=len(names) - len(todo) - len(procs))
                 if p.returncode:
