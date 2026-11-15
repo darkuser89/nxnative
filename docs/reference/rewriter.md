@@ -11,6 +11,16 @@ The NSO rewriter (`dm/tools/patch_nso.py`) and its per-build tables (`dm/tools/s
 - **Fix:** install `capstone>=5,<6` (README and CI). `patch_nso.py` checks the major version (`cs_version()`) before it disassembles anything, and the NSP script checks it before building or surveying, so the extraction is not wasted; both print the install command for the Python that runs them. Capstone 6 is not supported.
 - **Found on:** [Celeste](../../dm/games/01002B30028F6000/README.md#found-on-this-game).
 
+## Rewrite scan cost
+
+### Linear instruction scans repeat Python decoding and reachability checks
+
+- **Symptom:** a cold rewrite spends much longer in one large main than in its other modules, even with the x18/spin searches already using worker processes.
+- **Cause:** the frame-target search and general rewrite-site scan decode each four-byte word through repeated Python `unpack_from` calls. Spin-region retries also repeated the same data-range/reachability precheck, which depends only on the candidate head and back-edges, not on the retry mode.
+- **Fix:** use little-endian `struct.iter_unpack` over a memoryview for the linear passes, preserving their original word positions and code ranges; random look-backs keep their existing reader. Screen each spin head once before lock/retry analysis. Direct `spin_region1` calls retain their check; accepted worker heads must reproduce on the unchanged parent image. No patch, window, opcode mask or original-byte check is removed. The NSP script distributes its existing worker allowance by NSO/NRO text size (one worker minimum, one-machine-core-count maximum per module), so a large straggler is not limited to the same share as tiny modules; an explicit `DM_REWRITE_J` still overrides it.
+- **Found on:** [Star Fox](../../dm/games/0400E88025B1A000/README.md#build-timing), whose note records the four-module comparison and output-equivalence scope. Other games' complete rewrites have not been timed.
+- **Check:** `test_rewrite_parallel`, `test_spin_waits`, `test_fps_target`, `test_exclusive_windows` and `test_exclusive_order`; the rejected-head test requires rejection before lock/retry analysis. The full game comparison checks rewritten images and tables; the source-provenance digest is expected to change.
+
 ## Patch discovery
 
 ### Repository patches missing under bracketed paths

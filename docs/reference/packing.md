@@ -140,6 +140,54 @@
 - **Fix:** with `DMSH_TABLE_MEMO` set to a folder, each tool keeps a line per shader there (`c1_guard.memo`, `cb_extent.memo`): the SHA-256 of the files it read, then its answer. The next run takes the answer of every shader whose files hash the same and analyses the rest. The NSP script sets it to its shader cache folder for the build and for `chain_tables`. The memo's first line is a fingerprint of `c1_guard.py`, `cb_extent.py`, `dmsh_abi.py` and the header it reads (`dm/gfx/nvn/dmsh_abi.h`: the binding kinds `cb_extent.py` filters on), so an edit to any of them starts it empty. It holds the last run's answers only (6.5 MB for Ocarina of Time). Without the variable nothing is hashed.
 - **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game) v131072 on an M3 Max: both tables in 95.1 s without the memo, 96.8 s with an empty one and 6.5 s from a full one, byte-identical after the header in all three runs. `dm/tools/tests/test_nsp_chain.py` (`TableTools`: the same tables from the memo, its answer used, changed bytes analysed again, another version's memo not taken).
 
+### Large uncompressed NUP files copy slowly
+
+- **Symptom:** a fresh NUP build spends much longer copying the RomFS than its CPU time accounts for, even when its large files are stored without compression.
+- **Cause:** `Nup.copy` faulted in each mapped block, hashed it and wrote it before fetching the next one. Reads and writes on the game SSD were serialized; the SHA-256 check was not the dominant cost.
+- **Fix:** for raw entries of at least 64 MiB on platforms with `pread`, `copy_prefetched` reads one 8 MiB block ahead on a single worker thread while the caller hashes and writes the previous block. It keeps only one future read pending. Short reads are completed, EOF still fails the original size/hash check, and a failed write waits for the reader to stop before closing its file. Small and zstd-compressed entries keep the mapped path. No integrity check is skipped.
+- **Found on:** [Star Fox](../../dm/games/0400E88025B1A000/README.md#build-timing), whose update stores its 15.6 GB `data.zip` raw. That note records the full cold-build comparison and its cache scope; other games and storage devices have not been timed.
+- **Check:** `test_nsp_nup.Read.test_prefetched_raw_copy_checks_contents_and_short_reads` covers exact output, partial reads, premature EOF and a changed payload's SHA-256 failure. `test_prefetch_stops_on_write_failure` checks error propagation and cleanup. The NUP and chain test modules also pass.
+
+### Shader split reparses the same ZIP directory for every range
+
+- **Symptom:** a large ZIP is split into balanced range jobs, but each range constructs another complete central-directory index.
+- **Cause:** `zip_shaders` opened a new `ZipFile` per job, even when a worker immediately read another range of the same archive.
+- **Fix:** each worker retains at most one archive/index, closing it and its source when the path or device/inode/size/mtime/ctime changes. Failed opens close their source; pool initialization closes any reader inherited through fork, and normal exit closes the cached reader. Member decoding, CRC checks, format scans, labels and ordering are unchanged. It saves CPU work without assuming a filename identifies a shader.
+- **Found on:** [Star Fox](../../dm/games/0400E88025B1A000/README.md#build-timing), whose 114,154-member VZIP was split into 64 range jobs. The note distinguishes elapsed time from the larger CPU reduction.
+- **Check:** `test_split_viper` checks reuse, bounded reader lifetime, replacement despite equal size/restored mtime, failed-open cleanup and damaged VZIP data. The complete `test_split_*.py` reader suite also passes; direct complete splits compare the shader package and table rows.
+
+### Cold Mac host and font builds serialize independent work
+
+- **Symptom:** a cold Mac host stage includes a long font tail and waits for all prerequisite libraries before beginning native compilation; its combined timing cannot identify which part slowed down.
+- **Cause:** `build_mac_host` first built both decoder libraries and the host Metal header, then invoked make for C/Objective-C. Every native object also waited for that Metal header, although only `nvn/host_msl.m` includes it. `mac_host` then generated the fonts after the host. FontTools glyph serialization is Python CPU work, so five serial subset saves occupy one core.
+- **Fix:** with no output host, invoke the complete make graph immediately; keep the existing preflight and input-key checks for reuse. Only the embedding translation unit waits for the generated Metal header. Build independent fonts concurrently with the host, using one font process during a cold, already-parallel make. The standalone font tool uses at most five spawned workers (`J`, or explicit `jobs=1` for serial work). Subset settings and native compiler/link flags stay unchanged. Cancellation of the foreground host also stops the background font process group; failures publish no successful timing record.
+- **Measurement:** `logs/host_font_timing.json` records separate overlapping wall times, combined CPU time and load averages. Component wall times must not be added. It is replaced on a successful stage and removed at the next start, so a failed stage cannot inherit an older success record.
+- **Found on:** [Star Fox](../../dm/games/0400E88025B1A000/README.md#build-timing), whose note records repeated fresh-tree comparisons, runtime section/font equivalence and the limits of the earlier 43-second observation. The exact cause of that historical spike remains open: its component CPU/load measurements were not recorded.
+- **Check:** `test_host_msl.py` covers the cold dependency overlap, header availability, incremental reuse, decoder identity, concurrent fonts and cancellation/failure propagation. `test_make_shared_fonts.py` compares serial/parallel font tables, excluding only timestamps and their checksum, and retains coverage/name/hinting checks. `test_proc_group.Run.test_cancellation_event_stops_the_whole_group` checks real descendant cleanup.
+
+### Equivalent host links produce different stub bytes
+
+- **Symptom:** a byte comparison of two hosts finds differences only in `__TEXT,__stubs` and `__TEXT,__objc_stubs`, while implementation code and other file-backed data sections, addresses and sizes match.
+- **Cause:** the linker can choose different GOT locations for equivalent imported targets. A controlled relink of the same objects reproduced changed stub bytes, with unchanged stub addresses, imported symbols and Objective-C selectors. Raw stub hashes alone therefore do not establish changed program behavior.
+- **Check:** compare implementation sections first, then inspect every linker-generated stub symbolically with Apple's `dyld_info`: its GOT target must match the import, and its Objective-C selector must match its stub name. Do not exempt arbitrary implementation differences or infer whole-file identity from this check. No runtime patch is needed.
+- **Found on:** [Star Fox](../../dm/games/0400E88025B1A000/README.md#build-timing), whose note records the full-build verification and controlled relink result.
+
+### A fresh Mac app signature reads each large resource twice
+
+- **Symptom:** signing a new data bundle dominates a cold Mac app pack on an external SSD.
+- **Cause:** with only SHA-256 requested, Apple's [`SecCodeSigner::Signer::buildResources`](https://github.com/apple-oss-distributions/Security/blob/main/OSX/libsecurity_codesigning/lib/signer.cpp) hashes resources for the modern seal, then reads them again for the legacy SHA-1 seal. A legacy hash already in the modern seal is reused instead.
+- **Fix:** request `--digest-algorithm=sha1,sha256` for the nested bundles, host and app. Both resource hashes are computed in one read; SHA-256 and all resource coverage remain. The ordinary codesign failure and detritus retry paths are unchanged.
+- **Found on:** [Star Fox](../../dm/games/0400E88025B1A000/README.md#build-timing), the note records the alternating signing comparisons on the same data bundle, Mac and SSD, including measurement limits.
+- **Check:** `test_nsp_mac_app.App.test_single_pass_signing_keeps_sha256_and_rejects_tampered_resources` checks both hashes against the resource bytes, a successful signature verification and rejection after tampering.
+
+### A repeated Mac app build recompiles and signs unchanged data
+
+- **Symptom:** an unchanged `--platform mac-app` build reuses its shaders and offline pipeline archive, but rebuilds the launcher and signs the shader and pipeline data bundles again.
+- **Cause:** `pack_app.py` probed whether the packed shader image could be cloned, then discarded the answer because `copy_msl` writes a filtered image. On APFS the probe changed the source's ctime after the reuse key had read it. Separately, `pso_offline.py` rewrote identical `prebuilt.tsv`, `rest_pairs.tsv` and `archive.tsv` files even when it reused the binary archive. Their mtime and ctime are inputs to the packer's key, so both paths invalidated reuse without changing game data.
+- **Fix:** skip the unused clone probe for chain images; retain the probes for inputs that may actually be cloned. Write the small pipeline metadata files only when their bytes differ, including the script-only stamp. The packer's content and stat checks remain unchanged, so actual input changes still invalidate reuse.
+- **Found on:** [Star Fox](../../dm/games/0400E88025B1A000/README.md#build-timing), a warm Mac app build on an M3 Pro. The shader chain, game modules and runtime host are unchanged by these fixes.
+- **Check:** `test_nsp_mac_app.PackReuse.test_packed_shader_image_keeps_its_identity_and_reuses_the_app` checks that a probe with source-metadata side effects cannot invalidate the next pack. `test_pso_offline.Build.test_unchanged_metadata_keeps_its_identity_on_both_platforms` checks metadata identity on macOS and iOS, including script-only reuse; the existing tests still check changed stamps, pair lists and toolchains.
+
 ### The free-space check stops a build on a Mac that has the space
 
 - **Symptom:** the NSP script stops with `[RED] less than N GB free on the volume of <build folder>` before extraction (or `less than 5 GB free` before the IPA), while Finder and the Storage settings show far more available. The Mac app step can stop with `the app needs … GB on the volume of …`, and `pso_offline.py` with `GB free on the volume of …, metal-tt needs about …` or `GB free before merging`.
