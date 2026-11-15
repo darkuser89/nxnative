@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 from pathlib import Path
 
 import lz4.block
@@ -90,6 +91,52 @@ class ViperZip(unittest.TestCase):
         self.assertIsNone(ss.viper_shader(viper(ctl, code) + b'\0', 'x'))   # a trailing byte: the lengths do not add up
         self.assertIsNone(ss.viper_shader(viper(ctl[:0x20], code), 'x'))   # too short a control section
         self.assertEqual([(s, len(c), len(k)) for _, s, c, k in ss.viper_shader(viper(ctl, code), 'x')], [('ps', len(ctl), len(code))])
+
+    def test_range_jobs_reuse_one_index_and_close_it_when_archive_changes(self):
+        ss.close_zip_reader(); self.addCleanup(ss.close_zip_reader)
+        vs, ps = viper(*nvn2_stage(0x0461)), viper(*nvn2_stage(0x1462))
+        with tempfile.TemporaryDirectory() as t:
+            a, b = Path(t) / 'a.zip', Path(t) / 'b.zip'
+            a.write_bytes(vzip([member('first', vs, chain=False), member('second', ps, chain=False)]))
+            b.write_bytes(vzip([member('other', ps, chain=False)]))
+            import zipfile
+            with mock.patch.object(zipfile, 'ZipFile', wraps=zipfile.ZipFile) as constructors:
+                first = ss.scan_file((str(a), 'a.zip', (ss.ZIP, ('first',))))
+                archive = ss.zip_reader(str(a)); source = archive.fp
+                second = ss.scan_file((str(a), 'a.zip', (ss.ZIP, ('second',))))
+                self.assertEqual(constructors.call_count, 1)
+                self.assertEqual([v[1] for v in first[1].values()], ['vs'])
+                self.assertEqual([v[1] for v in second[1].values()], ['ps'])
+                ss.zip_reader(str(b))
+                self.assertIsNone(archive.fp); self.assertTrue(source.closed)
+                self.assertEqual(constructors.call_count, 2)
+            ss.close_zip_reader()
+
+    def test_same_size_and_restored_mtime_do_not_hide_a_replaced_member(self):
+        ss.close_zip_reader(); self.addCleanup(ss.close_zip_reader)
+        vs, ps = viper(*nvn2_stage(0x0461)), viper(*nvn2_stage(0x1462))
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / 'data.zip'; path.write_bytes(vzip([member('x', vs, chain=False)]))
+            old = ss.zip_reader(str(path)); before = path.stat()
+            changed = vzip([member('x', ps, chain=False)]); self.assertEqual(len(changed), before.st_size)
+            path.write_bytes(changed); os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            new = ss.zip_reader(str(path))
+            self.assertIsNot(new, old); self.assertIsNone(old.fp)
+            self.assertEqual(ss.zip_member(new, 'x'), ps)
+            ss.close_zip_reader()
+
+    def test_failed_index_open_closes_its_source(self):
+        ss.close_zip_reader(); self.addCleanup(ss.close_zip_reader)
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / 'bad.zip'; path.write_bytes(b'PK\x03\x04broken')
+            opened, real = [], ss.open
+            def take(*args, **kw):
+                f = real(*args, **kw); opened.append(f); return f
+            import zipfile
+            with mock.patch.object(ss, 'open', side_effect=take), self.assertRaises(zipfile.BadZipFile):
+                ss.zip_reader(str(path))
+            self.assertTrue(opened[0].closed)
+            self.assertIsNone(ss._ZIP_READER)
 
     def test_cli_counts_the_members(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -59,7 +59,7 @@
 #   With an update: give RomFS and main as comma-separated lists (base game first, e.g. data/v0/RomFS,data/v327680/RomFS); the output is the union of both versions (see main())
 #   Unity type trees need Unity's common string table, which is taken from the first main
 # Pair table: (vertex key, pixel key) of every BNSH variation (every Unity program); dmsh_build uses it to give vertex shaders the outputs their pixel shaders read but they do not write (see dmsh_build.py vs_pad)
-import base64, collections, concurrent.futures as cf, functools, glob, hashlib, json, os, re, struct, subprocess, sys, time, zlib
+import atexit, base64, collections, concurrent.futures as cf, functools, glob, hashlib, json, os, re, struct, subprocess, sys, time, zlib
 from typing import NoReturn
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../tools'))
 from romfs import os, open, is_image
@@ -1293,15 +1293,43 @@ def zip_jobs(files, parts=64):
         if cur: jobs.append((p, r, (ZIP, tuple(cur))))
     return jobs, {p for p, _, _ in zs}
 
+_ZIP_READER = None   # one archive per process: many range jobs share its central directory
+
+def close_zip_reader():
+    global _ZIP_READER
+    reader, _ZIP_READER = _ZIP_READER, None
+    if reader is not None:
+        try: reader[2].close()
+        finally: reader[1].close()
+
+atexit.register(close_zip_reader)
+
+def zip_reader(path):
+    """One live ZIP index per worker, invalidated by file identity; member reads still check their original CRC and codec rules."""
+    global _ZIP_READER
+    import zipfile
+    try: st = os.stat(path)
+    except OSError:
+        close_zip_reader(); raise
+    key = (os.path.abspath(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    reader = _ZIP_READER
+    if reader is not None and reader[0] == key and reader[2].fp is not None: return reader[2]
+    close_zip_reader()
+    source = open(path, 'rb')
+    try: archive = zipfile.ZipFile(source)
+    except BaseException:
+        source.close(); raise
+    _ZIP_READER = key, source, archive
+    return archive
+
 def zip_shaders(path, rel, names, out):
     """A range of zip members (zip_jobs), each inflated and scanned like a loose file: scan_blob, then whole GLSLC outputs (Portal's .nvsb files: a 0x60-byte 'NVSB' header, then one
     GLSLC output of a vertex and a pixel shader)"""
-    import zipfile
-    with open(path, 'rb') as source, zipfile.ZipFile(source) as z:
-        for nm in names:
-            d = zip_member(z, nm); n = len(out)
-            scan_blob(d, f'/{rel}/{nm}', out)
-            if len(out) == n and d[:4] != b'MSHD' and b'\x91\x68\x86\x19' in d: out += glslc_shaders(d, f'/{rel}/{nm}', need=False)
+    z = zip_reader(path)
+    for nm in names:
+        d = zip_member(z, nm); n = len(out)
+        scan_blob(d, f'/{rel}/{nm}', out)
+        if len(out) == n and d[:4] != b'MSHD' and b'\x91\x68\x86\x19' in d: out += glslc_shaders(d, f'/{rel}/{nm}', need=False)
 
 def pgdat_members(d, label):
     """A PlatinumGames DAT archive: 'DAT\\0', u32 file count, then the offsets of five tables: file offsets (u32 each), extensions (4 bytes each), names (u32 name length, then one name of that
@@ -2969,6 +2997,7 @@ ZDICTS, _ZD = {}, {}       # zstd dictionaries by ID (given when the pool starts
 
 def _pool_init(common, trees, zdicts={}):
     global COMMON, TREES, ZDICTS
+    close_zip_reader()   # a fork must not share an inherited archive cursor with its parent
     COMMON, TREES, ZDICTS = common, trees, zdicts
 
 def zs_dicts(romfs):
