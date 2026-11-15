@@ -31,11 +31,11 @@
 # More bases than --batch-size are compiled in sequential groups (batches.<arch>/<index>/ in the work folder, each cached by its own inputs) and merged with metal-pack: one metal-tt on
 # Super Mario Odyssey's 32,864 bases runs an 8 GB Mac out of paging space (docs/reference/shaders.md, Bounded groups for the offline pipeline compiler). The output is the same single file.
 # With compute pipelines, they and the bases are separate groups (batches.<arch>/c<index>/ and <index>/) merged the same way, so new pairs leave the compute pipelines compiled, and the
-# reverse. The compute groups are small (COMPUTE_BATCH) and run --jobs at a time: one metal-tt keeps about three cores busy.
+# reverse. The compute groups are small (COMPUTE_BATCH) and share --jobs slots with at most one base group: one metal-tt keeps about three cores busy.
 # Usage: pso_offline.py --msl <b-<chain> folder> --out <folder> --work <folder> [--game <id>] [--pairs <shader_pairs.tsv> [--pairs <pso_pairs.tsv>]] [--gpu g18p[,g17p]]
 #          [--depth gl|zero] [--platform ios|macos] [--os-min 27.0] [--script-only] [--batch-size N] [--shader-map <shader_map.tsv>] [--manifest <pso_manifest.tsv>] [--no-compute] [--jobs N]
 #   --game: the profile (DM_GAMES_DIR as for game.py) whose shader_pairs.tsv and pso_pairs.tsv are the pairs, whose shader_map.tsv and pso_manifest.tsv name the compute shaders, and
-#   whose depth_mode key the depth mode, unless --pairs / --shader-map / --manifest / --depth say; --no-compute: bases only; --jobs: metal-tt runs at a time for compute groups;
+#   whose depth_mode key the depth mode, unless --pairs / --shader-map / --manifest / --depth say; --no-compute: bases only; --jobs: total metal-tt runs at a time, at most one base group;
 #   --gpu: architectures, with or without the applegpu_ prefix (default g18p); --depth: the game's NVN depth mode (gl = near -w, NVN's default; zero = near 0, which the game sets
 #   with nvnDeviceSetDepthMode: the host knows it only at run time, so the profile says it; a wrong one costs the device its own prebuild, as without the archive);
 #   --os-min: the archives' system (default: for iOS the SDK's major version, e.g. 27.0; for macOS the major version this Mac runs, since the Mac app is built for the Mac that builds it).
@@ -253,6 +253,15 @@ def write_script(path, configuration):
     finally: part.unlink(missing_ok=True)
 
 
+def write_metadata(path: Path, text: str):
+    """Keep unchanged metadata's identity: the app packer's reuse key includes its mtime and ctime."""
+    data = text.encode('utf-8')
+    try:
+        if path.read_bytes() == data: return
+    except FileNotFoundError: pass
+    path.write_bytes(data)
+
+
 def library_digest(lib_dir, bases, computes=()):
     """The bytes metal-tt consumes: a profile/chain stamp does not change when the same shaders are rebuilt by another Metal compiler."""
     h = hashlib.sha256()
@@ -443,7 +452,7 @@ def compile_batches(lib_dir, bases, work, part, arch, platform, osmin, toolchain
     This bounds input count, not memory: a single pipeline can still exceed Apple's compiler resources.
     On M2, merged archives passed archive-only lookups of two synthetic pipelines and all 32,864 Odyssey bases.
     Other workloads and compiler versions can have different resource use.
-    The groups of bases run one after the other, as before; the compute groups, small, jobs at a time, each in its own folder (its TMPDIR).
+    The groups of bases run one after the other, with compute groups using the remaining jobs, each in its own folder (its TMPDIR).
     """
     groups = groups_of(bases, computes, batch_size, compute_size); total = len(groups); names = {name for name, _, _ in groups}
     failed = ([], [])   # what the groups left out (compile_isolating), returned
@@ -455,10 +464,20 @@ def compile_batches(lib_dir, bases, work, part, arch, platform, osmin, toolchain
         print(f'pso_offline: {arch}: batch {index}/{total}: ready ({"reused" if reused else "compiled"})', flush=True)
         fb, fc = read_failed(work / f'batches.{arch}' / name, arch); failed[0].extend(fb); failed[1].extend(fc)
         return piece
-    pieces = [one(i, *g) for i, g in enumerate(groups, 1) if g[1]]
-    with concurrent.futures.ThreadPoolExecutor(max(1, jobs)) as pool:   # a failed group stops the build once the others under way have finished (their pieces stay cached)
-        futures = [pool.submit(one, i, *g) for i, g in enumerate(groups, 1) if not g[1]]
-        pieces += [f.result() for f in futures]
+    base_groups = [(i, g) for i, g in enumerate(groups, 1) if g[1]]
+    compute_groups = [(i, g) for i, g in enumerate(groups, 1) if not g[1]]
+    # The base stream occupies one pool slot while it runs; once it finishes,
+    # that worker can take queued compute work too. Merge order is independent
+    # of completion order, with at most one base group and jobs compilers total.
+    def base_stream(): return [one(i, *g) for i, g in base_groups]
+    with concurrent.futures.ThreadPoolExecutor(max(1, jobs)) as pool:
+        base_future = pool.submit(base_stream) if base_groups else None
+        futures = [pool.submit(one, i, *g) for i, g in compute_groups]
+        try:
+            pieces = base_future.result() if base_future else []
+            pieces += [f.result() for f in futures]
+        finally:
+            for f in futures: f.cancel()   # a failure keeps completed groups, but cancels pending work
     part.unlink(missing_ok=True)
     need, free = max(2 << 30, sum(p.stat().st_size for p in pieces)), vol_space.free_bytes(work)
     if free < need: sys.exit(f'[RED] pso_offline: {free / 2**30:.1f} GB free before merging; need at least {need / 2**30:.1f} GB')
@@ -489,7 +508,7 @@ def main(argv=None):
     ap.add_argument('--shader-map', action='append', help='shader_map.tsv: its compute shaders get pipelines (default: the profile\'s)')
     ap.add_argument('--manifest', action='append', help='pso_manifest.tsv: its C rows first (default: the profile\'s)')
     ap.add_argument('--no-compute', action='store_true', help='no compute pipelines, the bases alone')
-    ap.add_argument('--jobs', type=int, default=JOBS, help=f'metal-tt runs at a time for the compute pipelines (default {JOBS}, half the logical CPUs)')
+    ap.add_argument('--jobs', type=int, default=JOBS, help=f'total metal-tt runs at a time, at most one base group (default {JOBS}, half the logical CPUs)')
     a = ap.parse_args(argv)
     if a.batch_size < 0: ap.error('--batch-size must be zero or positive')
     if a.game:
@@ -522,7 +541,7 @@ def main(argv=None):
           + ', '.join(f'{k} {v}' for k, v in left.items()) + f' ({time.time() - t0:.1f} s)')
     if shaders: print(f'pso_offline: {len(shaders)} compute shaders: {len(computes)} compute pipelines, left out: '
                       + ', '.join(f'{k} {v}' for k, v in cleft.items()))
-    if a.script_only: (out / 'prebuilt.tsv').write_text(st); return 0
+    if a.script_only: write_metadata(out / 'prebuilt.tsv', st); return 0
     if pairs and not bases and not rest: sys.exit('[RED] pso_offline: no base to build')   # pairs, but the host would leave out every one: wrong or missing libraries
     if not pairs: print('pso_offline: no pairs (only a header): nothing to build, no archive')   # a profile whose split found no pair (GitHub issue #338)
     if not bases and not computes: archs = []   # no pair, or every eligible pair needs device specialization, and no compute pipeline; clear old archives and still write the stamp and the remainder list
@@ -548,12 +567,12 @@ def main(argv=None):
         print(f'pso_offline: {arch}: {dst.stat().st_size / 2**20:.0f} MB in {time.time() - t1:.0f} s')
     for f in out.glob('*.mtl4a'):   # architectures no longer asked for
         if f.stem not in archs: f.unlink()
-    (out / 'prebuilt.tsv').write_text(st)
+    write_metadata(out / 'prebuilt.tsv', st)
     rest = list(dict.fromkeys([*rest, *map(pair_of, failed_bases)]))   # the pairs the device still builds: those with function constants, then those metal-tt failed on
     rp = out / 'rest_pairs.tsv'
-    if rest: rp.write_text(''.join(f'{v}\t{f}\n' for v, f in rest))
+    if rest: write_metadata(rp, ''.join(f'{v}\t{f}\n' for v, f in rest))
     else: rp.unlink(missing_ok=True)
-    (out / 'archive.tsv').write_text(f'# the pipeline archive made offline (dm/gfx/tools/pso_offline.py); the host reads prebuilt.tsv, not this file\narch\t{" ".join(archs)}\n'
+    write_metadata(out / 'archive.tsv', f'# the pipeline archive made offline (dm/gfx/tools/pso_offline.py); the host reads prebuilt.tsv, not this file\narch\t{" ".join(archs)}\n'
                                      f'platform\t{a.platform}\t{osmin}\ntoolchain\t{tv}\nbases\t{len(bases)}\nrest\t{len(rest)}\ncompute\t{len(computes)}\n'
                                      f'failed\t{len(set(failed_bases))} bases, {len(set(failed_computes))} compute pipelines (metal-tt could not compile them: left to the device)\n')
     return 0

@@ -15,6 +15,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import tracemalloc
 from unittest import mock
@@ -339,6 +340,24 @@ class Build(unittest.TestCase):
         self.assertEqual(len(self.calls), 3)
         self.assertFalse((self.out / 'rest_pairs.tsv').exists())
 
+    def test_unchanged_metadata_keeps_its_identity_on_both_platforms(self):
+        for platform in ('macos', 'ios'):
+            with self.subTest(platform=platform):
+                self.out, self.work = self.t / f'out-{platform}', self.t / f'work-{platform}'
+                args = ('--platform', platform, '--os-min', '27.0')
+                self.main(*args)
+                files = [self.out / n for n in ('prebuilt.tsv', 'rest_pairs.tsv', 'archive.tsv')]
+                for p in files: os.utime(p, ns=(1700000000000000000, 1700000000000000000))
+                def identity(p):
+                    s = p.stat()
+                    return s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, p.read_bytes()
+                before, calls = [identity(p) for p in files], len(self.calls)
+                self.main(*args)
+                self.assertEqual(len(self.calls), calls)
+                self.assertEqual([identity(p) for p in files], before)
+                self.main(*args, '--script-only')
+                self.assertEqual([identity(p) for p in files], before)
+
     def test_chain_move_reuses_binary_and_refreshes_metadata_for_both_platforms(self):
         for platform in ('macos', 'ios'):
             with self.subTest(platform=platform):
@@ -634,7 +653,7 @@ class Build(unittest.TestCase):
         def computes(): return [f['library'] for f in json.loads((self.work / 'bases.mtl4-json').read_text())['function_descriptors']['library_function_descriptors'] if f['library'].startswith('lib:k')]
         with mock.patch.object(self, 'fake_run', runner):
             self.main('--os-min', '27.0')
-            self.assertEqual(observed, [('compile', ['main0_z']), ('compile', []), ('merge', 2)])   # the bases, the compute pipelines, one archive
+            self.assertCountEqual(observed, [('compile', ['main0_z']), ('compile', []), ('merge', 2)])   # the bases, the compute pipelines, one archive
             self.assertEqual(computes(), ['lib:k_b'])   # kc has function constants: left to the host
             self.assertIn('compute\t1\n', (self.out / 'archive.tsv').read_text())
             self.assertEqual(sorted(d.name for d in (self.work / 'batches.applegpu_g18p').iterdir()), ['00001', 'c00001'])
@@ -655,6 +674,48 @@ class Build(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertTrue((self.out / 'applegpu_g18p.mtl4a').is_file())
         self.assertEqual((self.out / 'rest_pairs.tsv').read_text(), 'v\tc\n')
+
+    def test_base_and_compute_groups_overlap_with_a_shared_job_limit(self):
+        bases = [('v', str(i), 'f', 'main0') for i in range(3)]
+        computes = [('c', str(i)) for i in range(5)]
+        barrier, lock = threading.Barrier(3), threading.Lock()
+        active, peak = [0, 0], [0, 0]   # all compilers, base compilers
+        def compile_group(lib, group, work, arch, platform, osmin, toolchain, cgroup):
+            with lock:
+                active[0] += 1; active[1] += bool(group)
+                for i in range(2): peak[i] = max(peak[i], active[i])
+            try:
+                if work.name in ('00001', 'c00001', 'c00002'): barrier.wait(timeout=5)
+                work.mkdir(parents=True); piece = work / 'piece.mtl4a'; piece.write_bytes(work.name.encode())
+                return piece, False
+            finally:
+                with lock: active[0] -= 1; active[1] -= bool(group)
+        order = []
+        def merge(cmd, **kw):
+            order.extend(Path(p).parent.name for p in cmd if str(p).endswith('piece.mtl4a'))
+            self.part.write_bytes(b'archive'); return subprocess.CompletedProcess(cmd, 0)
+        self.part = self.work / 'merged.partial'
+        with mock.patch.object(po, 'compile_batch', compile_group), mock.patch.object(po.subprocess, 'run', merge), contextlib.redirect_stdout(io.StringIO()):
+            po.compile_batches(self.lib, bases, self.work, self.part, 'gpu', 'macos', '27.0', 'toolchain', 1, computes, jobs=3, compute_size=1)
+        self.assertEqual(peak, [3, 1])
+        self.assertEqual(order, ['00001', '00002', '00003', 'c00001', 'c00002', 'c00003', 'c00004', 'c00005'])
+
+    def test_completed_base_stream_releases_its_slot_to_compute_work(self):
+        first, second = threading.Event(), threading.Event()
+        def compile_group(lib, group, work, arch, platform, osmin, toolchain, cgroup):
+            if group:
+                self.assertTrue(first.wait(5), 'base and compute must overlap')
+            elif work.name == 'c00001':
+                first.set()
+                self.assertTrue(second.wait(5), 'the completed base must free a worker for queued compute work')
+            else: second.set()
+            work.mkdir(parents=True); piece = work / 'piece.mtl4a'; piece.write_bytes(b'group')
+            return piece, False
+        part = self.work / 'merged.partial'
+        def merge(cmd, **kw):
+            part.write_bytes(b'archive'); return subprocess.CompletedProcess(cmd, 0)
+        with mock.patch.object(po, 'compile_batch', compile_group), mock.patch.object(po.subprocess, 'run', merge), contextlib.redirect_stdout(io.StringIO()):
+            po.compile_batches(self.lib, [('v', 'v', 'f', 'f')], self.work, part, 'gpu', 'macos', '27.0', 'toolchain', 1, [('c', 'a'), ('c', 'b')], jobs=2, compute_size=1)
 
     def test_only_changed_batch_is_recompiled(self):
         bases = [('v_bp', f'vertex{i}', 'f_b', 'main0') for i in range(5)]
